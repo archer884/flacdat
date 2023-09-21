@@ -8,4 +8,5 @@ edition = "2021"
 [dependencies]
 audiotags = "0.4.1"
 clap = { version = "4.4.2", features = ["derive", "wrap_help"] }
+metaflac = "0.2.5"
 thiserror = "1.0.48"
