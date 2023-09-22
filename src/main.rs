@@ -5,9 +5,8 @@ use std::{
     process,
 };
 
-// use audiotags::{AudioTagEdit, AudioTagWrite, FlacTag, Tag};
 use clap::Parser;
-use metaflac::{block::VorbisComment, Block, Tag};
+use metaflac::Tag;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -46,9 +45,10 @@ impl<T: AsRef<Path>> PathGroup<T> {
         self.base.as_ref()
     }
 
-    // for testing
-    fn flac_with_name(&self, name: &str) -> PathBuf {
-        self.base.as_ref().with_file_name(name)
+    fn flac_output(&self, output_dir: impl AsRef<Path>) -> PathBuf {
+        let mut dir = PathBuf::from(output_dir.as_ref().to_owned());
+        dir.push(self.flac().file_name().unwrap());
+        dir
     }
 
     fn mp3(&self) -> &Path {
@@ -72,24 +72,16 @@ fn main() {
 
 fn run(args: Args) -> Result<()> {
     let paths = read_flac_paths(&args.dir)?;
-    for path in &paths {
-        // For each path, we will find (presumably) a flac file. There will be a corresponding mp3
-        // file, which should hypothetically contain metadata. We'll start with getting that
-        // metadata and printing it.
+    let output_dir = build_output_directory(&args.dir)?;
 
+    for path in &paths {
         let path_group = PathGroup::new(path);
         let tag = audiotags::Tag::new().read_from_path(path_group.mp3())?;
-
-        // When we have the metadata, apparently we also have a writer for said metadata, which we
-        // can then use to spray and pray. Who knew?
-
-        // Update: That shit doesn't even kind of work. I'm trying to do it manually now.
-
         let mut flac = Tag::read_from_path(path_group.flac())?;
         let comment = flac.vorbis_comments_mut();
 
-        if let Some(album) = tag.album() {
-            comment.set_album(vec![album.title]);
+        if let Some(album) = tag.album().map(|album| album.title) {
+            comment.set_album(vec![album]);
         }
 
         if let Some(title) = tag.title() {
@@ -104,7 +96,9 @@ fn run(args: Args) -> Result<()> {
             comment.set_track(track as u32);
         }
 
-        flac.write_to_path(path_group.flac())?;
+        let output_name = path_group.flac_output(&output_dir);
+        fs::copy(path_group.flac(), path_group.flac_output(&output_dir))?;
+        flac.write_to_path(&output_name)?;
     }
 
     Ok(())
@@ -128,4 +122,22 @@ fn read_flac_paths(path: &str) -> io::Result<Vec<PathBuf>> {
             })
         })
         .collect())
+}
+
+fn build_output_directory(path: &str) -> io::Result<PathBuf> {
+    let mut path = PathBuf::from(path);
+    path.push("with_metadata");
+
+    if path.exists() {
+        if fs::read_dir(&path)?.next().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "the output directory already exists and is non-empty",
+            ));
+        }
+    } else {
+        fs::create_dir(&path)?;
+    }
+
+    return Ok(path);
 }
