@@ -1,14 +1,22 @@
 use std::{
+    borrow::Cow,
     cell::OnceCell,
-    fs, io,
+    collections::HashMap,
+    env,
+    ffi::OsStr,
+    fs,
+    io::{self, Read},
     path::{Path, PathBuf},
     process,
 };
 
 use clap::Parser;
-use metaflac::Tag;
+use id3::TagLike;
+use serde::{Deserialize, Serialize};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+static FFMPEG: &str = "ffmpeg";
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
@@ -16,20 +24,69 @@ enum Error {
     IO(#[from] io::Error),
 
     #[error(transparent)]
-    Id3(#[from] audiotags::Error),
+    Id3(#[from] id3::Error),
 
     #[error(transparent)]
     Vorbis(#[from] metaflac::Error),
+
+    #[error("ffmpeg must be installed")]
+    FfmpegNotInstalled,
+
+    #[error("unsupported file type: {0}")]
+    UnsupportedFileTye(String),
+
+    #[error(transparent)]
+    Csv(#[from] csv::Error),
 }
 
 #[derive(Debug, Parser)]
 struct Args {
-    dir: String,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Parser)]
+enum Command {
+    Apply(ApplyAttributes),
+    List(List),
+    Convert(ConvertToFlac),
+}
+
+#[derive(Debug, Parser)]
+struct ApplyAttributes {
+    /// a file containing attributes to be applied
+    ///
+    /// By default, attributes will be read from stdin
+    #[arg(long)]
+    attributes: Option<String>,
+
+    /// directory for output files to be written to
+    #[arg(long)]
+    output: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct List {
+    files: Vec<String>,
+}
+
+#[derive(Debug, Parser)]
+struct ConvertToFlac {
+    files: Vec<String>,
+}
+
+impl ConvertToFlac {
+    fn wav_paths(&self) -> impl Iterator<Item = impl AsRef<Path> + '_> {
+        static EXTENSION: &str = ".wav";
+        self.files.iter().filter(|&file| file.ends_with(EXTENSION))
+    }
 }
 
 #[derive(Debug)]
 struct PathGroup<T> {
     base: T,
+
+    // Retained purely as reference material
     mp3_path: OnceCell<PathBuf>,
 }
 
@@ -46,98 +103,283 @@ impl<T: AsRef<Path>> PathGroup<T> {
     }
 
     fn flac_output(&self, output_dir: impl AsRef<Path>) -> PathBuf {
-        let mut dir = PathBuf::from(output_dir.as_ref().to_owned());
+        let mut dir = output_dir.as_ref().to_owned();
         dir.push(self.flac().file_name().unwrap());
         dir
     }
 
+    // Retained purely as reference material
     fn mp3(&self) -> &Path {
         self.mp3_path
             .get_or_init(|| self.base.as_ref().with_extension("mp3"))
     }
+}
 
-    fn track(&self) -> Option<usize> {
-        let s = self.base.as_ref().file_name()?.to_str()?;
-        let (track, _) = s.split_once(' ')?;
-        track.parse().ok()
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct Attributes {
+    album: Option<String>,
+    artist: Vec<String>,
+    title: Option<String>,
+    track: Option<u32>,
+    year: Option<i32>,
+}
+
+impl Attributes {
+    /// Loads attributes for a flac file. Only works on flac files.
+    fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+        static FLAC: &str = "flac";
+        static MP3: &str = "mp3";
+
+        let path = path.as_ref();
+
+        if path.extension() == Some(OsStr::new(FLAC)) {
+            return Self::from_flac_path(path);
+        }
+
+        if path.extension() == Some(OsStr::new(MP3)) {
+            return Self::from_mp3_path(path);
+        }
+
+        Err(Error::UnsupportedFileTye(path.display().to_string()))
+    }
+
+    fn with_path(self, path: impl AsRef<Path>) -> FileAttributes {
+        FileAttributes {
+            path: path.as_ref().to_string_lossy().into(),
+            album: self.album,
+            artist: self.artist,
+            title: self.title,
+            track: self.track,
+            year: self.year,
+        }
+    }
+
+    fn from_flac_path(path: &Path) -> Result<Self> {
+        let mut flac = metaflac::Tag::read_from_path(path)?;
+        let comment = flac.vorbis_comments_mut();
+
+        Ok(Attributes {
+            album: comment
+                .album()
+                .into_iter()
+                .flatten()
+                .next()
+                .map(|s| s.into()),
+            artist: comment.artist().cloned().unwrap_or_default(),
+            title: comment
+                .title()
+                .into_iter()
+                .flatten()
+                .next()
+                .map(|s| s.into()),
+            track: comment.track().into_iter().next(),
+
+            // This is basically unfindable on a flac/vorbis file:
+            // https://www.reddit.com/r/musichoarder/comments/p20pzi/how_do_you_store_date_tags_in_flacvorbis_comment/
+            year: comment
+                .get("YEAR")
+                .into_iter()
+                .flatten()
+                .next()
+                .and_then(|s| s.parse().ok()),
+        })
+    }
+
+    fn from_mp3_path(path: &Path) -> Result<Self> {
+        let tag = id3::Tag::read_from_path(path)?;
+
+        Ok(Attributes {
+            album: tag.album().map(|s| s.to_string()),
+            artist: tag
+                .artist()
+                .map(|s| vec![s.to_string()])
+                .unwrap_or_default(),
+            title: tag.title().map(|s| s.to_string()),
+            track: tag.track(),
+            year: tag.year(),
+        })
     }
 }
 
+enum Attribute {
+    Album,
+    Artist,
+    Title,
+    Track,
+    Year,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct FileAttributes {
+    path: String,
+    album: Option<String>,
+    artist: Vec<String>,
+    title: Option<String>,
+    track: Option<u32>,
+    year: Option<i32>,
+}
+
 fn main() {
-    if let Err(e) = run(Args::parse()) {
+    if let Err(e) = run(Args::parse_from(wild::args())) {
         eprintln!("{e}");
         process::exit(1);
     }
 }
 
 fn run(args: Args) -> Result<()> {
-    let paths = read_flac_paths(&args.dir)?;
-    let output_dir = build_output_directory(&args.dir)?;
+    if let Some(command) = &args.command {
+        return dispatch(command);
+    }
 
-    for path in &paths {
-        let path_group = PathGroup::new(path);
-        let tag = audiotags::Tag::new().read_from_path(path_group.mp3())?;
-        let mut flac = Tag::read_from_path(path_group.flac())?;
+    Ok(())
+}
+
+fn dispatch(command: &Command) -> Result<()> {
+    match command {
+        Command::Apply(args) => apply_attributes(args),
+        Command::List(args) => list_attributes(args),
+        Command::Convert(convert_args) => convert_wav_to_flac(convert_args),
+    }
+}
+
+fn apply_attributes(args: &ApplyAttributes) -> Result<()> {
+    let output: Cow<_> = match args.output.as_ref() {
+        Some(output) => Path::new(output).into(),
+        None => env::current_dir()?.into(),
+    };
+
+    if !output.exists() {
+        fs::create_dir(&output)?;
+    }
+
+    let attributes = read_attributes(args)?;
+
+    for (path, attr) in attributes {
+        let paths = PathGroup::new(&path);
+        let mut flac = metaflac::Tag::read_from_path(&path)?;
         let comment = flac.vorbis_comments_mut();
 
-        if let Some(album) = tag.album().map(|album| album.title) {
-            comment.set_album(vec![album]);
+        if let Some(album) = attr.album {
+            comment.set_album(vec![album.to_string()]);
         }
-
-        if let Some(title) = tag.title() {
+        if let Some(title) = attr.title {
             comment.set_title(vec![title]);
         }
-
-        if let Some(artist) = tag.artist() {
-            comment.set_artist(vec![artist]);
+        if let Some(track) = attr.track {
+            comment.set_track(track);
         }
+        comment.set_artist(attr.artist);
 
-        if let Some(track) = path_group.track() {
-            comment.set_track(track as u32);
+        let output_name = paths.flac_output(&output);
+        if output_name.exists() {
+            return Err(Error::IO(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "writing metadata would overwrite existing file",
+            )));
         }
-
-        let output_name = path_group.flac_output(&output_dir);
-        fs::copy(path_group.flac(), path_group.flac_output(&output_dir))?;
+        fs::copy(paths.flac(), &output_name)?;
         flac.write_to_path(&output_name)?;
     }
 
     Ok(())
 }
 
-fn read_flac_paths(path: &str) -> io::Result<Vec<PathBuf>> {
-    Ok(fs::read_dir(path)?
-        .into_iter()
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let meta = entry.metadata().ok()?;
-            if !meta.is_file() {
-                return None;
-            }
+fn list_attributes(args: &List) -> Result<()> {
+    let collection: Result<Vec<_>> = args
+        .files
+        .iter()
+        .map(|path| Attributes::from_path(path).map(|attributes| attributes.with_path(path)))
+        .collect();
+    let collection = collection?;
 
-            let path = entry.path();
-            Some(path).filter(|path| {
-                path.extension()
-                    .map(|ext| ext == &*"flac")
-                    .unwrap_or_default()
-            })
-        })
-        .collect())
-}
+    let mut out = io::stdout().lock();
+    let mut writer = csv::WriterBuilder::new()
+        .delimiter(b'\t')
+        .from_writer(&mut out);
+    writer.write_record(&["path", "album", "artist", "title", "track", "year"])?;
 
-fn build_output_directory(path: &str) -> io::Result<PathBuf> {
-    let mut path = PathBuf::from(path);
-    path.push("with_metadata");
+    for item in collection {
+        writer.write_field(&item.path)?;
 
-    if path.exists() {
-        if fs::read_dir(&path)?.next().is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "the output directory already exists and is non-empty",
-            ));
+        if let Some(album) = &item.album {
+            writer.write_field(&album)?;
+        } else {
+            writer.write_field("")?;
         }
-    } else {
-        fs::create_dir(&path)?;
+
+        writer.write_field(item.artist.join(","))?;
+
+        if let Some(title) = &item.title {
+            writer.write_field(&title)?;
+        } else {
+            writer.write_field("")?;
+        }
+
+        if let Some(track) = item.track {
+            writer.write_field(track.to_string())?;
+        } else {
+            writer.write_field("")?;
+        }
+
+        if let Some(year) = item.year {
+            writer.write_field(year.to_string())?;
+        } else {
+            writer.write_field("")?;
+        }
+
+        writer.write_record(None::<&[u8]>)?;
     }
 
-    return Ok(path);
+    writer.flush()?;
+
+    Ok(())
+}
+
+fn convert_wav_to_flac(args: &ConvertToFlac) -> Result<()> {
+    ensure_ffmpeg()?;
+
+    assert!(args.wav_paths().next().is_some());
+
+    for path in args.wav_paths() {
+        let path = dbg!(path.as_ref());
+        let flac_path = dbg!(path.with_extension("flac"));
+
+        process::Command::new(FFMPEG)
+            .arg("-i")
+            .arg(path)
+            .arg(flac_path)
+            .status()?;
+    }
+
+    Ok(())
+}
+
+fn ensure_ffmpeg() -> Result<()> {
+    process::Command::new(FFMPEG)
+        .output()
+        .map_err(|_| Error::FfmpegNotInstalled)?;
+    Ok(())
+}
+
+fn read_attributes(args: &ApplyAttributes) -> Result<HashMap<String, FileAttributes>> {
+    let text = match &args.attributes {
+        Some(path) => fs::read_to_string(path)?,
+        None => {
+            let mut buf = String::new();
+            io::stdin().lock().read_to_string(&mut buf)?;
+            buf
+        }
+    };
+
+    let mut bytes = text.as_bytes();
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(b'\t')
+        .from_reader(&mut bytes);
+    let attributes: csv::Result<Vec<FileAttributes>> = reader.deserialize().collect();
+    let attributes = attributes?;
+
+    Ok(attributes
+        .into_iter()
+        .map(|attributes| (attributes.path.clone(), attributes))
+        .collect())
 }
