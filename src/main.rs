@@ -293,9 +293,7 @@ fn list_attributes(args: &List) -> Result<()> {
     let collection = collection?;
 
     let mut out = io::stdout().lock();
-    let mut writer = csv::WriterBuilder::new()
-        .delimiter(b'\t')
-        .from_writer(&mut out);
+    let mut writer = csv::Writer::from_writer(&mut out);
     writer.write_record(&["path", "album", "artist", "title", "track", "year"])?;
 
     for item in collection {
@@ -372,9 +370,7 @@ fn read_attributes(args: &ApplyAttributes) -> Result<HashMap<String, FileAttribu
     };
 
     let mut bytes = text.as_bytes();
-    let mut reader = csv::ReaderBuilder::new()
-        .delimiter(b'\t')
-        .from_reader(&mut bytes);
+    let mut reader = csv::Reader::from_reader(&mut bytes);
     let attributes: csv::Result<Vec<FileAttributes>> = reader.deserialize().collect();
     let attributes = attributes?;
 
